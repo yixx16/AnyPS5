@@ -1,5 +1,6 @@
 #include "SceTypes.hpp"
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
@@ -10,6 +11,10 @@ int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
 int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
 int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out, const KernelUseconds* timo);
 int APS5_VABI sceKernelAddUserEvent(KernelEqueue eq, int id);
+int APS5_VABI sceKernelAddReadEvent(KernelEqueue eq, int fd, std::size_t size, void* udata);
+int APS5_VABI socketpair_nid_postfix(int, int, int, int*);
+std::int64_t APS5_VABI send_nid_postfix(int, const void*, std::uint64_t, int);
+int APS5_VABI close_nid_postfix(int);
 int APS5_VABI sceKernelAddUserEventEdge(KernelEqueue eq, int id);
 int APS5_VABI sceKernelTriggerUserEvent(KernelEqueue eq, int id, void* udata);
 int APS5_VABI sceKernelDeleteUserEvent(KernelEqueue eq, int id);
@@ -214,6 +219,67 @@ static void VerifyEdgeUserEventReportedOnce() {
     Require(sceKernelDeleteEqueue(eq) == SCE_OK);
 }
 
+static void VerifyLevelEventsTakeTurns() {
+    KernelEqueue eq = 0;
+    Require(sceKernelCreateEqueue(&eq, "turns") == SCE_OK);
+    KernelEvent events[4]{};
+    int count = 0;
+    const KernelUseconds poll = 0;
+    int payload = 0;
+
+    Require(sceKernelAddUserEvent(eq, 5) == SCE_OK);
+    Require(sceKernelAddUserEvent(eq, 6) == SCE_OK);
+    Require(sceKernelAddUserEvent(eq, 7) == SCE_OK);
+    Require(sceKernelTriggerUserEvent(eq, 5, &payload) == SCE_OK);
+    Require(sceKernelTriggerUserEvent(eq, 6, &payload) == SCE_OK);
+    Require(sceKernelTriggerUserEvent(eq, 7, &payload) == SCE_OK);
+    for (const std::uintptr_t expected : {5, 6, 7, 5, 6}) {
+        Require(sceKernelWaitEqueue(eq, events, 1, &count, &poll) == SCE_OK);
+        Require(count == 1 && sceKernelGetEventId(&events[0]) == expected);
+    }
+    Require(sceKernelWaitEqueue(eq, events, 2, &count, &poll) == SCE_OK);
+    Require(count == 2 && sceKernelGetEventId(&events[0]) == 7 && sceKernelGetEventId(&events[1]) == 5);
+    Require(sceKernelDeleteUserEvent(eq, 5) == SCE_OK);
+    Require(sceKernelWaitEqueue(eq, events, 4, &count, &poll) == SCE_OK);
+    Require(count == 2 && sceKernelGetEventId(&events[0]) == 6 && sceKernelGetEventId(&events[1]) == 7);
+    Require(sceKernelDeleteEqueue(eq) == SCE_OK);
+}
+
+static void VerifyReadableSocketsTakeTurns() {
+    KernelEqueue eq = 0;
+    Require(sceKernelCreateEqueue(&eq, "sockets") == SCE_OK);
+    KernelEvent events[4]{};
+    int count = 0;
+    const KernelUseconds poll = 0;
+    const KernelUseconds wait = 1000000;
+    int first[2];
+    int second[2];
+    Require(socketpair_nid_postfix(1, 1, 0, first) == 0);
+    Require(socketpair_nid_postfix(1, 1, 0, second) == 0);
+    Require(sceKernelAddReadEvent(eq, first[0], 0, nullptr) == SCE_OK);
+    Require(sceKernelAddReadEvent(eq, second[0], 0, nullptr) == SCE_OK);
+    Require(send_nid_postfix(first[1], "a", 1, 0) == 1);
+    Require(send_nid_postfix(second[1], "bc", 2, 0) == 2);
+    for (int attempt = 0; attempt < 50 && count != 2; ++attempt) {
+        Require(sceKernelWaitEqueue(eq, events, 4, &count, &wait) == SCE_OK);
+    }
+    Require(count == 2);
+    const std::uintptr_t leading = sceKernelGetEventId(&events[0]);
+    const std::uintptr_t trailing = sceKernelGetEventId(&events[1]);
+    Require(leading != trailing);
+    for (const std::uintptr_t expected : {leading, trailing, leading}) {
+        Require(sceKernelWaitEqueue(eq, events, 1, &count, &poll) == SCE_OK);
+        Require(count == 1 && sceKernelGetEventId(&events[0]) == expected);
+    }
+    Require(sceKernelWaitEqueue(eq, events, 4, &count, &poll) == SCE_OK);
+    Require(count == 2 && sceKernelGetEventId(&events[0]) == trailing && sceKernelGetEventId(&events[1]) == leading);
+    Require(sceKernelGetEventData(&events[0]) + sceKernelGetEventData(&events[1]) == 3);
+    for (const int descriptor : {first[0], first[1], second[0], second[1]}) {
+        Require(close_nid_postfix(descriptor) == 0);
+    }
+    Require(sceKernelDeleteEqueue(eq) == SCE_OK);
+}
+
 static void VerifyRepeatedAmprCompletionsAreNotLost() {
     KernelEqueue eq = 0;
     Require(sceKernelCreateEqueue(&eq, "ampr") == SCE_OK);
@@ -251,6 +317,8 @@ int main() {
     VerifyUserEventReportedOncePerWait();
     VerifyBlockingWaitReportsLevelEventOnce();
     VerifyEdgeUserEventReportedOnce();
+    VerifyLevelEventsTakeTurns();
+    VerifyReadableSocketsTakeTurns();
     VerifyRepeatedAmprCompletionsAreNotLost();
 
     KernelEqueue eq = 0;

@@ -215,6 +215,37 @@ static void SocketPair() {
     Require(close_nid_postfix(kq) == 0);
 }
 
+static void SocketsTakeTurns() {
+    const int kq = kqueue_nid_postfix();
+    int first[2];
+    int second[2];
+    Require(socketpair_nid_postfix(Unix, Stream, 0, first) == 0);
+    Require(socketpair_nid_postfix(Unix, Stream, 0, second) == 0);
+    KernelEvent events[4]{};
+    Require(Apply(kq, Change(static_cast<std::uintptr_t>(first[0]), EvfiltRead, EvAdd)) == 0);
+    Require(Apply(kq, Change(static_cast<std::uintptr_t>(second[0]), EvfiltRead, EvAdd)) == 0);
+    Require(send_nid_postfix(first[1], "a", 1, 0) == 1);
+    Require(send_nid_postfix(second[1], "bc", 2, 0) == 2);
+    int count = 0;
+    for (int attempt = 0; attempt < 50 && count != 2; ++attempt) {
+        count = Wait(kq, events, 4);
+        Require(count >= 1);
+    }
+    Require(count == 2);
+    const std::uintptr_t leading = events[0].ident;
+    const std::uintptr_t trailing = events[1].ident;
+    Require(leading != trailing);
+    for (const std::uintptr_t expected : {leading, trailing, leading}) {
+        Require(Poll(kq, events, 1) == 1 && events[0].ident == expected);
+    }
+    Require(Poll(kq, events, 4) == 2 && events[0].ident == trailing && events[1].ident == leading);
+    Require(events[0].data + events[1].data == 3);
+    for (const int descriptor : {first[0], first[1], second[0], second[1]}) {
+        Require(close_nid_postfix(descriptor) == 0);
+    }
+    Require(close_nid_postfix(kq) == 0);
+}
+
 static void Errors() {
     const int kq = kqueue_nid_postfix();
     KernelEvent events[4]{};
@@ -416,6 +447,7 @@ int main() {
     Timers();
     UserEvents();
     SocketPair();
+    SocketsTakeTurns();
     Errors();
     FileWatch();
 #ifndef _WIN32

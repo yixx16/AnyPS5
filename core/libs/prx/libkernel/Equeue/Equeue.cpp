@@ -15,6 +15,10 @@ static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
 static std::mutex g_equeueMutex;
 static uint64_t g_nextEqueue = 1;
 
+static bool IsLevel(const KernelEqueueEvent& event) {
+    return (event.event.flags & (EV_CLEAR | EV_DISPATCH)) == 0;
+}
+
 extern "C" {
 
 KernelEqueuePrivate::KernelEqueuePrivate(KernelEqueue handle, bool reportOncePerWait) : m_handle(handle), m_reportOncePerWait(reportOncePerWait) {}
@@ -119,11 +123,14 @@ int KernelEqueuePrivate::CollectTriggered(KernelEvent* ev, int num) {
         return CollectOncePerWait(ev, num);
     }
     int ret = 0;
+    std::list<KernelEqueueEvent> requeued;
     for (auto it = m_events.begin(); it != m_events.end() && ret < num;) {
         auto& e = *it;
         bool erase = false;
+        bool reported = false;
         while (e.triggered && ret < num) {
             ev[ret++] = e.event;
+            reported = true;
             if ((e.event.flags & EV_ONESHOT) != 0) {
                 erase = true;
                 break;
@@ -142,8 +149,15 @@ int KernelEqueuePrivate::CollectTriggered(KernelEvent* ev, int num) {
             e.pendingEvents.pop_front();
             e.triggered = true;
         }
-        it = erase ? m_events.erase(it) : std::next(it);
+        const auto next = std::next(it);
+        if (erase) {
+            m_events.erase(it);
+        } else if (reported && (IsLevel(e) || e.triggered)) {
+            requeued.splice(requeued.end(), m_events, it);
+        }
+        it = next;
     }
+    m_events.splice(m_events.end(), requeued);
     return ret;
 }
 
@@ -173,7 +187,7 @@ int KernelEqueuePrivate::CollectOncePerWait(KernelEvent* ev, int num) {
             e.event.data = 0;
         }
         const auto next = std::next(it);
-        if (e.triggered) {
+        if (IsLevel(e)) {
             requeued.splice(requeued.end(), m_events, it);
         }
         it = next;
